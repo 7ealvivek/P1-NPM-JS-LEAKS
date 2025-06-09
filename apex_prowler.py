@@ -10,312 +10,204 @@ import shutil
 import concurrent.futures
 import time
 import requests
+import re
 from threading import Lock
 
-# --- Configuration ---
-# EDIT THESE VALUES
-SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/T03JPK11LNM/B0908RQP1GB/hrmkhkKGbO72J0OMa9g4kb0"
+# Suppress only the InsecureRequestWarning from urllib3
+from urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-# Paths to tools if they are not in your system's PATH
-# Example: GITLEAKS_PATH = "/home/user/tools/gitleaks"
-# Leave as is if they are in your PATH.
+# --- Configuration ---
+SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/T03JPK11LNM/B0908RQP1GB/hrmkhkKGbO72J0OMa9g4kb0"
+CUSTOM_GITLEAKS_CONFIG_PATH = "./custom-gitleaks.toml"
 TOOL_PATHS = {
     "katana": "katana", "httpx": "httpx", "gau": "gau", "subjs": "subjs",
     "nuclei": "nuclei", "gitleaks": "gitleaks", "secretfinder": "secretfinder",
-    "js-beautify": "js-beautify", "keyscope": "keyscope"
+    "mantra": "mantra", "js-beautify": "js-beautify", "keyscope": "keyscope"
 }
+PUBLIC_PACKAGE_BLOCKLIST = ['react','react-dom','vue','angular','jquery','lodash','moment','express','axios','webpack']
 
-# Heuristics for Dependency Confusion
-PUBLIC_PACKAGE_BLOCKLIST = [
-    'react', 'react-dom', 'vue', 'angular', 'jquery', 'lodash', 'moment', 'express',
-    'axios', 'webpack', 'next', 'nuxt', 'svelte', 'redux', 'jest', 'eslint', 'babel',
-    'typescript', 'core-js', 'bootstrap', 'd3', 'three', 'material-ui'
-]
-PRIVATE_PACKAGE_KEYWORDS = ['internal', '-api', 'private', '-sdk', 'corp', 'confidential']
-
-# --- Color & Logging Setup ---
-class C:
-    RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE, END = '\033[91m', '\033[92m', '\033[93m', '\033[94m', '\033[95m', '\033[96m', '\033[97m', '\033[0m'
-
-log_lock = Lock()
-def log(level, message):
+# --- UI & Helper Functions ---
+class C: RED,GREEN,YELLOW,BLUE,MAGENTA,CYAN,WHITE,END='\033[91m','\033[92m','\033[93m','\033[94m','\033[95m','\033[96m','\033[97m','\033[0m'
+log_lock=Lock()
+def log(level, message, overwrite=False):
+    end_char = '\r' if overwrite else '\n'
     with log_lock:
-        color_map = {"INFO": C.BLUE, "SUCCESS": C.GREEN, "WARN": C.YELLOW, "ERROR": C.RED, "TASK": C.CYAN, "FINDING": C.MAGENTA}
-        print(f"{color_map.get(level, C.WHITE)}[{level.ljust(7)}] {C.END}{message}")
-
-# --- Banner ---
+        sys.stdout.write(f"{' ' * 120}\r");sys.stdout.flush()
+        color_map={"INFO":C.BLUE,"SUCCESS":C.GREEN,"WARN":C.YELLOW,"ERROR":C.RED,"TASK":C.CYAN,"FINDING":C.MAGENTA}
+        sys.stdout.write(f"{color_map.get(level,C.WHITE)}[{level.ljust(7)}] {C.END}{message}{end_char}");sys.stdout.flush()
 def display_banner():
-    banner = f"""
-{C.BLUE}
-        ____  _   _
-       / ___|| | | |  ___  _ __
-       \\___ \\| |_| | / _ \\| '_ \\
-        ___) |  _  ||  __/| | | |
-       |____/|_| |_| \\___||_| |_|
-
-{C.WHITE}   A  P  E  X     P  R  O  W  L  E  R{C.END}
-{C.MAGENTA}   -------------------------------------
+    print(f"""{C.BLUE}
+        ____  _   _             ____  _
+       / ___|| | | |  ___  _ __ / ___|| |__   __ _ _ __   __ _  ___
+       \\___ \\| |_| | / _ \\| '_ \\\\___ \\| '_ \\ / _` | '_ \\ / _` |/ _ \\
+        ___) |  _  ||  __/| | | |___) | | | | (_| | | | | (_| |  __/
+       |____/|_| |_| \\___||_| |_|____/|_| |_|\\__,_|_| |_|\\__, |\\___|
+{C.WHITE}   A  P  E  X     P  R  O  W  L  E  R          |___/  {C.MAGENTA}v3.1{C.END}
+{C.MAGENTA}   ------------------------------------------------------------
       {C.GREEN}Bugcrowd:  bugcrowd.com/realvivek
       {C.CYAN}X/Twitter: x.com/starkcharry
       {C.WHITE}GitHub:    github.com/7ealvivek
-{C.MAGENTA}   -------------------------------------
-{C.END}"""
-    print(banner)
-    time.sleep(0.5)
-
-# --- Tool Runner & Dependency Check ---
+{C.MAGENTA}   ------------------------------------------------------------
+{C.END}""");time.sleep(0.5)
 def check_tools():
-    log("INFO", "Checking for required tools...")
-    for tool, path in TOOL_PATHS.items():
-        if not shutil.which(path):
-            log("ERROR", f"Tool '{tool}' not found at path '{path}'. Please install it or correct the path in TOOL_PATHS.")
-            sys.exit(1)
-    log("SUCCESS", "All required tools are installed.")
-
-def run_command(command, log_file=None):
-    process = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if log_file:
-        with open(log_file, 'w') as f:
-            f.write(process.stdout)
-    if process.returncode != 0:
-        log("WARN", f"Command failed with exit code {process.returncode}: {command}")
-        log("WARN", f"Stderr: {process.stderr.strip()}")
-    return process.stdout
-
-# --- Slack Notifier ---
-def send_slack_alert(data):
+    log("TASK","Checking for required tools...")
+    if not os.path.exists(CUSTOM_GITLEAKS_CONFIG_PATH):log("ERROR",f"Gitleaks config not found at: {CUSTOM_GITLEAKS_CONFIG_PATH}. Please create it.");sys.exit(1)
+    for tool in TOOL_PATHS:
+        if not shutil.which(TOOL_PATHS[tool]): log("ERROR",f"Tool '{tool}' not found.");sys.exit(1)
+    log("SUCCESS","All required tools are installed.")
+def run_command(command):
     try:
-        requests.post(SLACK_WEBHOOK_URL, json=data, timeout=10)
-    except requests.RequestException as e:
-        log("ERROR", f"Failed to send Slack alert: {e}")
+        p=subprocess.run(command,shell=True,capture_output=True,text=True,check=False)
+        if p.returncode not in [0,1,2]: log("WARN", f"Command exited non-zero (code {p.returncode}): {command.split()[0]}...")
+        return p
+    except FileNotFoundError:log("ERROR", f"Command not found: {command.split()[0]}.");sys.exit(1)
+def send_slack_alert(data):
+    if not SLACK_WEBHOOK_URL or "XXX" in SLACK_WEBHOOK_URL:return
+    try:requests.post(SLACK_WEBHOOK_URL,json=data,timeout=10)
+    except requests.RequestException:pass
+def format_slack_message(status,tool,sev,finding_type,details,url):
+    colors={"VERIFIED":"#FF0000","HIGH_CONFIDENCE":"#D2691E"};emojis={"VERIFIED":"🔥","HIGH_CONFIDENCE":"🌟"}
+    return{"attachments":[{"color":colors.get(status,"#FFA500"),"blocks":[
+        {"type":"header","text":{"type":"plain_text","text":f"{emojis.get(status,' ')} {sev.upper()} Finding","emoji":True}},
+        {"type":"section","fields":[{"type":"mrkdwn","text":f"*Scanner:*\n{tool}"},{"type":"mrkdwn","text":f"*Source:*\n<{url}>"}]},
+        {"type":"section","text":{"type":"mrkdwn","text":f"*Finding/Package:*\n`{finding_type}`"}},
+        {"type":"section","text":{"type":"mrkdwn","text":f"*Details:*\n```{details}```"}}]}]}
 
-def format_slack_message(status, tool, sev, type, details, url):
-    color_map = {"VERIFIED": "#FF0000", "DEP_CONFUSION": "#D2691E", "UNVERIFIED": "#FFA500"}
-    emoji_map = {"VERIFIED": "🔥", "DEP_CONFUSION": "⛓️", "UNVERIFIED": "⚠️"}
+# --- Core Modules ---
+def run_discovery(hosts_file,direct_js_file,output_dir,use_gau):
+    log("TASK","Phase 1: Asset Discovery",overwrite=True);raw_js_file=os.path.join(output_dir,"js.raw");open(raw_js_file,'a').close();cmds=[]
+    if os.path.exists(hosts_file)and os.path.getsize(hosts_file)>0:
+        if use_gau:log("INFO", "GAU is enabled for deep discovery.")
+        cmds.extend([f"{TOOL_PATHS['subjs']} -i {hosts_file} -c 25 >> {raw_js_file}",f"{TOOL_PATHS['katana']} -silent -list {hosts_file} -jc -d 5 >> {raw_js_file}"])
+        if use_gau:cmds.append(f"{TOOL_PATHS['gau']} -t 10 < {hosts_file} >> {raw_js_file}")
+    if cmds:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(cmds))as e:e.map(run_command,cmds)
+    final_urls_file=os.path.join(output_dir,"js.txt");run_command(f"cat {raw_js_file} {direct_js_file} 2>/dev/null|sort -u|{TOOL_PATHS['httpx']} -silent -mc 200 > {final_urls_file}");count=0
+    if os.path.exists(final_urls_file):
+        with open(final_urls_file)as f:count=sum(1 for _ in f)
+    log("SUCCESS",f"Phase 1 Complete. Found {C.YELLOW}{count}{C.END} live JS files for analysis.");return final_urls_file
 
-    return {
-        "attachments": [{
-            "color": color_map.get(status, "#FFA500"),
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": f"{emoji_map.get(status, ' ')} {sev.upper()} Finding", "emoji": True}},
-                {"type": "section", "fields": [
-                    {"type": "mrkdwn", "text": f"*Scanner:*\n{tool}"},
-                    {"type": "mrkdwn", "text": f"*Source:*\n<{url}>"}
-                ]},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Vulnerability/Package:*\n`{type}`"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Details:*\n```{details}```"}}
-            ]
-        }]
+def run_secrets_scan(js_urls_file,output_dir):
+    log("TASK","Phase 2: Initial Parallel Scan",overwrite=True);so=os.path.join(output_dir,"findings");os.makedirs(so,exist_ok=True)
+    sc=[f"{TOOL_PATHS['nuclei']} -l {js_urls_file} -t exposures/tokens/ -s critical,high -j -o {os.path.join(so,'nuclei.json')} -silent",f"cat {js_urls_file}|{TOOL_PATHS['mantra']} -s > {os.path.join(so,'mantra.txt')}",f"secretfinder -i {js_urls_file} -o {os.path.join(so,'sf_report.html')}"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3)as e:list(e.map(run_command,sc))
+    log("SUCCESS","Phase 2 Complete. Initial scanners finished.")
+    log("TASK","Phase 3: Deep Scan with Gitleaks",overwrite=True);jcd=os.path.join(output_dir,"js_content");os.makedirs(jcd,exist_ok=True)
+    run_command(f"cat {js_urls_file}|xargs -n 1 -P 10 wget -q -P {jcd} --no-check-certificate")
+    for fn in os.listdir(jcd):
+        if os.path.isfile(os.path.join(jcd,fn)):run_command(f"{TOOL_PATHS['js-beautify']} -r {os.path.join(jcd,fn)}")
+    run_command(f"{TOOL_PATHS['gitleaks']} detect -s {jcd} --no-git -r {os.path.join(so,'gitleaks.json')} -c {CUSTOM_GITLEAKS_CONFIG_PATH}")
+    log("SUCCESS","Phase 3 Complete. Deep scan finished.");consolidate_and_verify(so,js_urls_file)
+
+def consolidate_and_verify(scan_dir,js_urls_file):
+    log("TASK","Phase 4: Consolidating Findings...",overwrite=True)
+    raw_findings, all_secrets = [], set()
+    total_findings = 0
+    
+    # --- Parser Definitions ---
+    parsers = {
+        "Nuclei": ("nuclei.json", "jsonl"),
+        "Gitleaks": ("gitleaks.json", "json"),
+        "Mantra": ("mantra.txt", "text"),
+        "SecretFinder": ("sf_report.html", "html")
     }
 
-# --- Scanner Modules ---
-def run_discovery(hosts_file, ips_file, use_gau, output_dir):
-    log("TASK", "Starting asset discovery...")
-    raw_js_file = os.path.join(output_dir, "js_urls.raw")
-
-    commands = []
-    if os.path.exists(hosts_file) and os.path.getsize(hosts_file) > 0:
-        if use_gau:
-            log("INFO", "GAU is enabled for deep discovery.")
-            commands.append(f"{TOOL_PATHS['gau']} --threads 10 --providers wayback,otx,commoncrawl < {hosts_file} >> {raw_js_file}")
-        commands.append(f"{TOOL_PATHS['subjs']} -i {hosts_file} -c 25 >> {raw_js_file}")
-        commands.append(f"{TOOL_PATHS['katana']} -silent -list {hosts_file} -jc -d 5 -c 25 >> {raw_js_file}")
-
-    if os.path.exists(ips_file) and os.path.getsize(ips_file) > 0:
-        commands.append(f"{TOOL_PATHS['katana']} -silent -list {ips_file} -jc -d 3 >> {raw_js_file}")
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(commands)) as executor:
-        executor.map(run_command, commands)
-
-    log("INFO", "De-duplicating and verifying live JS URLs...")
-    js_urls_file = os.path.join(output_dir, "js_urls.txt")
-    run_command(f"sort -u {raw_js_file} | {TOOL_PATHS['httpx']} -silent -mc 200 > {js_urls_file}")
-    
-    with open(js_urls_file) as f:
-        count = sum(1 for _ in f)
-    log("SUCCESS", f"Discovery complete. Found {count} live JavaScript files.")
-    return js_urls_file
-
-def run_dependency_confusion(hosts_file, output_dir):
-    log("TASK", "Scanning for Dependency Confusion...")
-    package_json_urls_file = os.path.join(output_dir, "exposed_package_jsons.txt")
-    run_command(f"{TOOL_PATHS['httpx']} -l {hosts_file} -path /package.json -mc 200 -silent > {package_json_urls_file}")
-    
-    if not os.path.exists(package_json_urls_file) or os.path.getsize(package_json_urls_file) == 0:
-        log("INFO", "No exposed package.json files found.")
-        return
-
-    log("SUCCESS", f"Found exposed package.json files! Analyzing dependencies...")
-    with open(package_json_urls_file) as f:
-        for url in f:
-            url = url.strip()
-            try:
-                r = requests.get(url, timeout=10)
-                if r.status_code == 200:
-                    data = r.json()
-                    deps = {**data.get('dependencies', {}), **data.get('devDependencies', {})}
-                    for pkg in deps:
-                        if pkg in PUBLIC_PACKAGE_BLOCKLIST: continue
-
-                        # Check if package exists on public NPM registry
-                        npm_url = f"https://registry.npmjs.org/{pkg}"
-                        npm_check = requests.head(npm_url, timeout=5)
-                        if npm_check.status_code == 404:
-                            # It doesn't exist. Now check for private name heuristics.
-                            is_private_name = any(kw in pkg for kw in PRIVATE_PACKAGE_KEYWORDS)
-                            
-                            if is_private_name:
-                                log("FINDING", f"HIGH-CONFIDENCE Dependency Confusion: {pkg} from {url}")
-                                details = f"High-confidence private package '{pkg}' is NOT registered on public NPM. It was found in an exposed package.json and matches private naming heuristics."
-                                alert = format_slack_message("DEP_CONFUSION", "Package Prowler", "Critical", pkg, details, url)
-                                send_slack_alert(alert)
-
-            except Exception as e:
-                log("WARN", f"Could not analyze package.json from {url}: {e}")
-
-def run_secrets_scan(js_urls_file, output_dir):
-    log("TASK", "Scanning for Hardcoded Secrets...")
-    secrets_output = os.path.join(output_dir, "secrets_findings")
-    os.makedirs(secrets_output, exist_ok=True)
-    
-    commands = [
-        f"{TOOL_PATHS['nuclei']} -l {js_urls_file} -t exposures/tokens/ -s critical,high -json -o {os.path.join(secrets_output, 'nuclei.json')}",
-        f"{TOOL_PATHS['secretfinder']} -i {js_urls_file} --json -o {os.path.join(secrets_output, 'secretfinder.json')}"
-    ]
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        executor.map(run_command, commands)
+    # --- Master Parsing Loop with Transparent Logging ---
+    for tool, (filename, file_type) in parsers.items():
+        count = 0
+        file_path = os.path.join(scan_dir, filename)
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            log("INFO", f"  -> No output from {tool} to process.")
+            continue
         
-    log("INFO", "Downloading JS files for Gitleaks deep scan...")
-    js_content_dir = os.path.join(output_dir, "js_content")
-    os.makedirs(js_content_dir, exist_ok=True)
-    run_command(f"xargs -a {js_urls_file} -n 1 -P 10 wget -q -P {js_content_dir} --no-check-certificate")
-    
-    # Beautify JS for better scanning
-    for filename in os.listdir(js_content_dir):
-        run_command(f"{TOOL_PATHS['js-beautify']} -f {os.path.join(js_content_dir, filename)} -o {os.path.join(js_content_dir, filename)}")
-        
-    run_command(f"{TOOL_PATHS['gitleaks']} detect -s {js_content_dir} --no-git -r {os.path.join(secrets_output, 'gitleaks.json')}")
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                if file_type == "html":
+                    content = f.read()
+                    blocks = re.findall(r'<h6>(.*?)</h6>.*?<ul>(.*?)</ul>', content, re.DOTALL)
+                    for url, findings_html in blocks:
+                        for item in re.findall(r'<li>(.*?)</li>', findings_html):
+                            if ':' in item:
+                                parts = item.split(':', 1); f_type, secret = parts[0].strip(), parts[1].strip()
+                                all_secrets.add(secret); raw_findings.append({'tool':tool,'secret':secret,'type':f_type,'url':url.strip()}); count+=1
+                else:
+                    lines = f.readlines() if file_type in ["jsonl", "text"] else [f.read()]
+                    for line in lines:
+                        if not line.strip(): continue
+                        if file_type == "jsonl": item = json.loads(line)
+                        elif file_type == "json": item = json.loads(line) # Handles single JSON object file
+                        else: item = line
 
-    log("SUCCESS", "Initial secret scan complete. Consolidating findings...")
-    return consolidate_and_verify_secrets(secrets_output, js_urls_file)
+                        if tool == "Nuclei": s, m = item.get('extracted-results',[item.get('matcher-name','N/A')])[0], {'type': item['template-id'],'url':item['host']}
+                        elif tool == "Gitleaks": s, m = item['Secret'], {'type':item['Description'],'url':next((l.strip() for l in open(js_urls_file)if os.path.basename(item['File'])in l),item['File'])}
+                        elif tool == "Mantra":
+                            if "found in"in item and "secret"in item: p=item.split();s=p[p.index("secret:")+1].strip("'");m={'type':item.split('[')[1].split(']')[0],'url':p[p.index("in")+1]}
+                            else: continue
+                        
+                        all_secrets.add(s); raw_findings.append({'tool':tool,'secret':s,**m}); count+=1
+                        if file_type == "json" and isinstance(json.loads(line), list): break # Gitleaks is a list in a single json file
+            log("INFO", f"  -> Consolidated {count} findings from {tool}.")
+            total_findings += count
+        except Exception as e:
+            log("WARN", f"  -> Failed to parse output from {tool}. Error: {e}")
 
-def consolidate_and_verify_secrets(scan_dir, js_urls_file):
-    log("TASK", "Consolidating and Verifying Secrets...")
-    all_secrets = set()
-    raw_findings = []
-
-    # Parse Nuclei
+    # --- Verification and Alerting ---
+    if not all_secrets:log("SUCCESS","Phase 4 Complete. No potential secrets found.");return
+    log("INFO",f"Phase 4 Complete. Total raw findings: {total_findings}. Verifying {len(all_secrets)} unique secrets...",overwrite=True)
+    sf=os.path.join(scan_dir,"secrets.txt");vf=os.path.join(scan_dir,"verified.json")
+    with open(sf,'w')as f:f.write('\n'.join(s for s in all_secrets if s))
+    run_command(f"{TOOL_PATHS['keyscope']} -f {sf} --json -o {vf}")
+    verified_secrets=set()
     try:
-        with open(os.path.join(scan_dir, "nuclei.json")) as f:
-            for line in f:
-                d = json.loads(line)
-                secret = d.get('extracted-results', [d.get('matcher-name', 'N/A')])[0]
-                all_secrets.add(secret)
-                raw_findings.append({'tool': 'Nuclei', 'secret': secret, 'type': d['template-id'], 'url': d['host']})
-    except FileNotFoundError: pass
-
-    # Parse Gitleaks
-    try:
-        with open(os.path.join(scan_dir, 'gitleaks.json')) as f:
-            data = json.load(f)
-            for d in data:
-                all_secrets.add(d['Secret'])
-                filename = os.path.basename(d['File'])
-                url = next((line.strip() for line in open(js_urls_file) if filename in line), d['File'])
-                raw_findings.append({'tool': 'Gitleaks', 'secret': d['Secret'], 'type': d['Description'], 'url': url})
-    except (FileNotFoundError, json.JSONDecodeError): pass
-
-    # Parse SecretFinder
-    try:
-        with open(os.path.join(scan_dir, 'secretfinder.json')) as f:
-            data = json.load(f)
-            for d in data.get('results', []):
-                 all_secrets.add(d['secret'])
-                 raw_findings.append({'tool': 'SecretFinder', 'secret': d['secret'], 'type': d['type_of_secret'], 'url': d['url']})
-    except (FileNotFoundError, json.JSONDecodeError): pass
-    
-    if not all_secrets:
-        log("INFO", "No potential secrets found to verify.")
-        return
-        
-    secrets_to_verify_file = os.path.join(scan_dir, "secrets_to_verify.txt")
-    with open(secrets_to_verify_file, 'w') as f:
-        f.write('\n'.join(all_secrets))
-
-    log("INFO", f"Verifying {len(all_secrets)} unique potential secrets with Keyscope...")
-    verified_file = os.path.join(scan_dir, "verified.json")
-    run_command(f"{TOOL_PATHS['keyscope']} -f {secrets_to_verify_file} --json -o {verified_file}")
-    
-    verified_secrets = set()
-    try:
-        with open(verified_file) as f:
-            data = json.load(f)
-            for finding in data.get('findings', []):
-                if finding.get('verified') is True:
-                    verified_secrets.add(finding['secret_value'])
-    except (FileNotFoundError, json.JSONDecodeError): pass
-        
-    log("SUCCESS", f"Verification complete. Found {len(verified_secrets)} confirmed, active secrets.")
-    
-    # Final Reporting Loop
+        with open(vf) as f:
+            for find in json.load(f).get('findings',[]):
+                if find.get('verified')is True:verified_secrets.add(find['secret_value'])
+    except Exception:pass
+    log("SUCCESS",f"Phase 5 Complete. Verification found {C.YELLOW}{len(verified_secrets)}{C.END} active secrets.")
+    log("TASK","Phase 6: Reporting High-Priority Findings...",overwrite=True)
+    sent_secrets=set()
     for finding in raw_findings:
-        if finding['secret'] in verified_secrets:
-            log("FINDING", f"VERIFIED CRITICAL secret found by {finding['tool']} in {finding['url']}")
-            alert = format_slack_message("VERIFIED", finding['tool'], "Verified Critical", finding['type'], finding['secret'], finding['url'])
-        else:
-            log("FINDING", f"UNVERIFIED secret found by {finding['tool']} in {finding['url']}")
-            alert = format_slack_message("UNVERIFIED", finding['tool'], "High", finding['type'], finding['secret'], finding['url'])
+        secret=finding.get('secret')
+        if not secret or secret in sent_secrets:continue
+        
+        is_verified=secret in verified_secrets
+        is_high_confidence=finding['tool']=='Gitleaks'
+        
+        if is_verified: status,sev,color="VERIFIED","Verified Critical",C.RED
+        elif is_high_confidence: status,sev,color="HIGH_CONFIDENCE","High-Confidence",C.YELLOW
+        else: continue
+            
+        log("FINDING",f"{'🔥'if is_verified else'🌟'} {color}[{sev.upper()}]{C.END} [{finding['tool']}] {finding['type']}")
+        log("FINDING",f"{C.WHITE}   ├─ URL:    {finding['url']}{C.END}")
+        log("FINDING",f"{C.WHITE}   └─ Secret: {secret}{C.END}")
+        alert=format_slack_message(status,finding['tool'],sev,finding['type'],secret,finding['url'])
         send_slack_alert(alert)
-
+        sent_secrets.add(secret)
+    if not sent_secrets: log("SUCCESS","All findings were low-confidence and logged locally.")
+    else: log("SUCCESS","All high-priority alerts sent to Terminal and Slack.")
 
 # --- Main Orchestrator ---
 def main():
-    parser = argparse.ArgumentParser(description="Apex Prowler - Automated Secret & Dependency Confusion Hunter")
-    parser.add_argument('-t', '--targets', required=True, help="Path to a file containing target hosts, one per line.")
-    parser.add_argument('-g', '--use-gau', action='store_true', help="Enable GAU for deep discovery from web archives (slower).")
-    parser.add_argument('-p', '--dep-confusion', action='store_true', help="Enable the Dependency Confusion scanning module.")
-    parser.add_argument('--no-secrets', action='store_true', help="Disable the hardcoded secrets scanning module.")
+    parser=argparse.ArgumentParser(description="Apex Prowler v3.1 - The Inspector")
+    parser.add_argument('-t','--targets',required=True,help="File containing target assets.")
+    parser.add_argument('-g','--use-gau',action='store_true',help="Enable GAU for deep discovery.")
+    args=parser.parse_args()
+    display_banner();check_tools()
+    od=os.path.join("results",f"apex_prowler_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}");os.makedirs(od,exist_ok=True)
+    log("INFO",f"Results will be saved in: {C.WHITE}{od}{C.END}")
+    hf=os.path.join(od,"d_hosts.txt");djf=os.path.join(od,"d_js.txt")
+    with open(args.targets)as fi,open(hf,'w')as fh,open(djf,'w')as fj:
+        for l in fi:
+            l=l.strip();
+            if not l:continue
+            if ".js"in l:fj.write(l+'\n')
+            else:h=l.replace("https://","").replace("http://","").split('/')[0];h and fh.write(h+'\n')
+    juf=run_discovery(hf,djf,od,args.use_gau)
+    # The dependency confusion module was removed for simplicity but can be re-added to the executor below if desired.
+    if os.path.exists(juf)and os.path.getsize(juf)>0:run_secrets_scan(juf,od)
+    log("SUCCESS",f"Apex Prowler scan finished. Logs are in {od}")
 
-    args = parser.parse_args()
-    
-    display_banner()
-    check_tools()
-
-    output_dir = os.path.join("results", f"apex_prowler_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    os.makedirs(output_dir, exist_ok=True)
-    log("INFO", f"Results will be saved in: {output_dir}")
-
-    # Normalize targets
-    hosts_file = os.path.join(output_dir, "targets.hosts")
-    ips_file = os.path.join(output_dir, "targets.ips")
-    with open(args.targets) as f_in, open(hosts_file, 'w') as f_hosts, open(ips_file, 'w') as f_ips:
-        for line in f_in:
-            line = line.strip().replace("https://", "").replace("http://", "").split('/')[0]
-            if line:
-                # Basic IP regex
-                if all(c.isdigit() or c == '.' for c in line) and line.count('.') == 3:
-                     f_ips.write(line + '\n')
-                else:
-                     f_hosts.write(line + '\n')
-
-    # Main workflow
-    js_urls_file = run_discovery(hosts_file, ips_file, args.use_gau, output_dir)
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = []
-        if args.dep_confusion:
-            futures.append(executor.submit(run_dependency_confusion, hosts_file, output_dir))
-        if not args.no_secrets and os.path.exists(js_urls_file) and os.path.getsize(js_urls_file) > 0:
-            futures.append(executor.submit(run_secrets_scan, js_urls_file, output_dir))
-        
-        # Wait for all tasks to complete
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                log("ERROR", f"A scanning module failed: {e}")
-
-    log("SUCCESS", "Apex Prowler scan complete.")
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":
+    try:main()
+    except KeyboardInterrupt:log("WARN","\nScan interrupted.");sys.exit(0)
